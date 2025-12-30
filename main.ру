@@ -1,12 +1,116 @@
 import os
+from typing import Dict, Any
+
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "secret")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+if not BOT_TOKEN:
+    # Не падаем при импорте, но будет ошибка при старте
+    print("WARNING: TELEGRAM_BOT_TOKEN is not set")
 
 app = FastAPI()
-tg_app = Application.builder().token(BOT_TOKEN).build()
 
-async def start_cmd(update
+tg_app: Application | None = None
+
+# Простая память по пользователю (на MVP ок)
+user_state: Dict[int, Dict[str, Any]] = {}
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    user_state[update.effective_user.id] = {"step": 1, "data": {}}
+    await update.message.reply_text(
+        "Привет! Я помогу подобрать недвижимость 🏡\n\n"
+        "Скажи, пожалуйста, в каком городе/районе ищем? (Ялта/Севастополь/Алушта и т.д.)"
+    )
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    uid = update.effective_user.id
+    text = update.message.text.strip()
+
+    st = user_state.get(uid, {"step": 0, "data": {}})
+    step = st.get("step", 0)
+
+    if step == 1:
+        st["data"]["city"] = text
+        st["step"] = 2
+        user_state[uid] = st
+        await update.message.reply_text("Ок! Цель: для жизни / инвестиций / отдыха?")
+        return
+
+    if step == 2:
+        st["data"]["goal"] = text
+        st["step"] = 3
+        user_state[uid] = st
+        await update.message.reply_text("Поняла. Бюджет примерно какой? (например: 5 млн, до 12 млн)")
+        return
+
+    if step == 3:
+        st["data"]["budget"] = text
+        st["step"] = 0
+        user_state[uid] = st
+
+        city = st["data"].get("city")
+        goal = st["data"].get("goal")
+        budget = st["data"].get("budget")
+
+        await update.message.reply_text(
+            "Супер, записала запрос ✅\n\n"
+            f"Город/район: {city}\n"
+            f"Цель: {goal}\n"
+            f"Бюджет: {budget}\n\n"
+            "Напиши /start чтобы создать новый запрос."
+        )
+        return
+
+    # Если пользователь пишет без /start
+    await update.message.reply_text("Напиши /start — и я соберу запрос на подбор 🙂")
+
+
+@app.on_event("startup")
+async def on_startup():
+    global tg_app
+    tg_app = Application.builder().token(BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", start_cmd))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    await tg_app.initialize()
+    # start() нужен, чтобы работали внутренние механики приложения
+    await tg_app.start()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global tg_app
+    if tg_app:
+        await tg_app.stop()
+        await tg_app.shutdown()
+        tg_app = None
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    # Telegram присылает секрет в заголовке X-Telegram-Bot-Api-Secret-Token (если ты его задала при setWebhook)
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+    data = await request.json()
+    update = Update.de_json(data, tg_app.bot)  # type: ignore
+    await tg_app.process_update(update)        # type: ignore
+    return {"ok": True}
